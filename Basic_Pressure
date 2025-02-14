@@ -1,0 +1,59 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// กำหนดที่อยู่ของจอ LCD I2C (อาจต้องเปลี่ยนเป็น 0x3F ในบางกรณี)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int pressurePin = A0;  // ขาอนาล็อกที่ใช้เชื่อมต่อกับเซ็นเซอร์
+const float VCC = 3.3;       // แรงดันจ่ายให้เซ็นเซอร์ (5V)
+const float R_SHUNT = 165.0; // ค่าความต้านทานชันท์ของเซ็นเซอร์ (Ω)
+
+// ค่าความดันต่ำสุดและสูงสุดของเซ็นเซอร์ (แก้ไขตามสเปกของเซ็นเซอร์)
+const float P_MIN = 0.0;  
+const float P_MAX = 10.0;  
+
+void setup() {
+  Serial.begin(115200);  // เริ่มการสื่อสารผ่าน Serial Monitor
+  lcd.init();          // เริ่มต้นใช้งาน LCD
+  lcd.backlight();     // เปิดไฟแบคไลท์ของจอ LCD
+  
+  // แสดงข้อความเริ่มต้น
+  lcd.setCursor(0, 0);
+  lcd.print("Pressure Sensor");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  int rawADC = analogRead(pressurePin);  // อ่านค่าจากขา A0
+  float voltage = (rawADC / 1023.0) * VCC; // คำนวณแรงดันไฟฟ้า
+  float current = (voltage / R_SHUNT) * 1000; // คำนวณกระแส (mA)
+  float pressure = ((current - 4.0) / (20.0 - 4.0)) * (P_MAX - P_MIN) + P_MIN; // แปลงค่ากระแสเป็นความดัน
+
+  // แสดงผลใน Serial Monitor
+  Serial.println("\n--- Sensor Debug ---");
+  Serial.print("Raw ADC: "); Serial.println(rawADC);
+  Serial.print("Voltage: "); Serial.print(voltage, 3); Serial.println(" V");
+  Serial.print("Current: "); Serial.print(current, 3); Serial.println(" mA");
+  Serial.print("Pressure: "); Serial.print(pressure, 2); Serial.println(" Bar");
+
+  lcd.clear();  // ล้างหน้าจอ LCD ก่อนแสดงผลใหม่
+
+  if (current < 3.5) { // ตรวจสอบว่ามีกระแสต่ำกว่าค่าปกติ (แสดงว่าเซ็นเซอร์อาจหลุดหรือผิดพลาด)
+    Serial.println("[ERROR] Sensor may be disconnected!");
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Wiring!");
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("Pressure: ");
+    lcd.setCursor(0, 1);
+    lcd.print(pressure, 2);
+    lcd.print(" Bar");
+  }
+
+  delay(1000);  // หน่วงเวลา 1 วินาที
+}
