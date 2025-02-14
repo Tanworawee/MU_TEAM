@@ -1,0 +1,126 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// กำหนดขา I2C ให้ใช้ D5, D6 แทน
+#define I2C_SDA D6  // GPIO12
+#define I2C_SCL D5  // GPIO14
+
+const char* ssid = "Tan_Pocket";
+const char* password = "15932456";
+const char* powerbiUrl = "https://api.powerbi.com/beta/9bc585f9-a8b8-431c-9013-efa7b2b40cdf/datasets/2d0edd16-9f4b-4eac-a861-ef3607905b6a/rows?experience=power-bi&key=J3BDVfqJHNjxfbTtlBnm6x8P18oWRLpt3bLDzS6E3kQqA9dVIlR5SwDwUuhDOMvMHPksyu2KIriQYwpqpurSFg%3D%3D";
+
+// กำหนดขาเซ็นเซอร์
+const int pressurePin = A0;
+
+// ค่าคงที่ของระบบแรงดัน
+const float VCC = 3.3;
+const float R_SHUNT = 150.0;
+const float P_MIN = 0.0;
+const float P_MAX = 10.0;
+
+// สร้าง object สำหรับ LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // หรือ 0x3F ถ้า 0x27 ไม่ทำงาน
+
+WiFiClientSecure client;
+HTTPClient http;
+
+void setup() {
+    Serial.begin(9600);
+    
+    // เริ่มต้น I2C และ LCD
+    Wire.begin(I2C_SDA, I2C_SCL);
+    lcd.init();
+    lcd.backlight();
+    
+    // แสดงข้อความเริ่มต้น
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Pressure Sensor");
+    lcd.setCursor(0, 1);
+    lcd.print("Initializing...");
+    
+    // เชื่อมต่อ WiFi
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 20) {
+        delay(500);
+        Serial.print(".");
+        lcd.setCursor(0, 1);
+        lcd.print("Connecting WiFi " + String(retry));
+        retry++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Connected!");
+        lcd.setCursor(0, 1);
+        lcd.print(WiFi.localIP());
+        delay(2000);
+    } else {
+        Serial.println("\nFailed to connect to WiFi!");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Failed!");
+        return;
+    }
+    
+    client.setInsecure();
+    lcd.clear();
+}
+
+void loop() {
+    // อ่านค่าแรงดันจากขา A0
+    int rawADC = analogRead(pressurePin);
+    float voltage = (rawADC / 1023.0) * VCC;
+    float current = (voltage / R_SHUNT) * 1000;
+    float pressure = ((current - 4.0) / (20.0 - 4.0)) * (P_MAX - P_MIN) + P_MIN;
+    
+    // แสดงค่าที่ Serial Monitor
+    Serial.println("\n--- Sensor Reading ---");
+    Serial.print("Raw ADC: "); Serial.println(rawADC);
+    Serial.print("Voltage: "); Serial.print(voltage, 3); Serial.println(" V");
+    Serial.print("Current: "); Serial.print(current, 3); Serial.println(" mA");
+    Serial.print("Pressure: "); Serial.print(pressure, 2); Serial.println(" Bar");
+    
+    // แสดงค่าที่ LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Pressure:");
+    lcd.setCursor(0, 1);
+    lcd.print(pressure, 2);
+    lcd.print(" Bar");
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        String jsonData = "[{\"Pressure\":" + String(pressure, 2) + "}]";
+        
+        http.begin(client, powerbiUrl);
+        http.addHeader("Content-Type", "application/json");
+        
+        int httpCode = http.POST(jsonData);
+        String payload = http.getString();
+        
+        Serial.print("HTTP Response Code: ");
+        Serial.println(httpCode);
+        Serial.print("Response: ");
+        Serial.println(payload);
+        
+        http.end();
+    } else {
+        Serial.println("WiFi Disconnected!");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Lost!");
+    }
+    
+    delay(5000);
+}
