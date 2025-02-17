@@ -1,0 +1,234 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <Adafruit_MAX31865.h>
+#include <TimeLib.h>
+#include <WiFiUdp.h>
+
+// WiFi configuration
+const char* ssid = "Tan_Pocket";
+const char* password = "15932456";
+
+// Power BI endpoint
+const char* powerbiUrl = "https://api.powerbi.com/beta/9bc585f9-a8b8-431c-9013-efa7b2b40cdf/datasets/2d0edd16-9f4b-4eac-a861-ef3607905b6a/rows?experience=power-bi&key=J3BDVfqJHNjxfbTtlBnm6x8P18oWRLpt3bLDzS6E3kQqA9dVIlR5SwDwUuhDOMvMHPksyu2KIriQYwpqpurSFg%3D%3D";
+
+// MySQL Server configuration
+const char* mysqlServer = "http://192.168.0.178:8080/esp8266/insert_data.php";
+
+// MAX31865 configuration (SPI)
+#define MAX_CS   D3  // Chip Select (CS)
+#define MAX_CLK  D5  // Clock (SCK)
+#define MAX_SDO  D6  // MISO
+#define MAX_SDI  D7  // MOSI
+
+// LCD I2C configuration
+#define LCD_SDA  D2
+#define LCD_SCL  D1
+
+// Initialize MAX31865
+Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX_CS, MAX_SDI, MAX_SDO, MAX_CLK);
+
+// ✅ เพิ่มประกาศตัวแปร WiFiClientSecure
+WiFiClientSecure secureClient;
+WiFiClient client;
+HTTPClient http;
+HTTPClient httpMySQL;
+
+// Initialize LCD (ตรวจสอบที่อยู่ I2C: 0x27 หรือ 0x3F)
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // เปลี่ยนเป็น 0x3F ถ้าจำเป็น
+
+// NTP settings
+static const char ntpServerName[] = "us.pool.ntp.org";
+const int timeZone = 7;  // Time Zone (WIB)
+WiFiUDP Udp;
+unsigned int localPort = 8888;
+time_t getNtpTime();
+void sendNTPpacket(IPAddress &address);
+String datetime;
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    // Initialize I2C
+    Wire.begin(LCD_SDA, LCD_SCL);
+
+    // Initialize LCD
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("Initializing...");
+    delay(2000);
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Connecting WiFi");
+
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 20) {
+        delay(500);
+        Serial.print(".");
+        retry++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Connected");
+        lcd.setCursor(0, 1);
+        lcd.print(WiFi.localIP());
+    } else {
+        Serial.println("\nFailed to connect to WiFi!");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Failed!");
+        return;
+    }
+    
+    // ✅ ต้องใช้ setInsecure() สำหรับ WiFiClientSecure
+    secureClient.setInsecure();
+    
+    // Initialize MAX31865
+    thermo.begin(MAX31865_3WIRE);
+
+    // Start NTP Client
+    Udp.begin(localPort);
+    setSyncProvider(getNtpTime);
+    setSyncInterval(300);
+}
+
+void loop() {
+    if (WiFi.status() == WL_CONNECTED) {
+        float temperature = thermo.temperature(100.0, 430.0);
+        
+        if (!isnan(temperature)) {
+            getDatetime();  // Get current datetime
+            Serial.print("Temperature: ");
+            Serial.println(temperature);
+            Serial.print("Datetime: ");
+            Serial.println(datetime);
+
+            // อัปเดตค่าบน LCD
+            updateLCD(temperature, datetime);
+            
+            // ส่งข้อมูลไปยัง Power BI
+            sendToPowerBI(temperature, datetime);
+            
+            // ส่งข้อมูลไปยัง MySQL
+            sendToMySQL(temperature);
+        } else {
+            Serial.println("Failed to read temperature!");
+        }
+
+        checkSensorFaults();
+    } else {
+        Serial.println("WiFi Disconnected");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WiFi Disconnected");
+    }
+    
+    delay(5000);  // Wait 5 seconds before next reading
+}
+
+void sendToMySQL(float temperature) {
+    httpMySQL.begin(client, mysqlServer);
+    httpMySQL.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String httpRequestData = "Temperature=" + String(temperature, 2) + "&Datetime=" + datetime;
+    int httpResponseCode = httpMySQL.POST(httpRequestData);
+
+    Serial.print("MySQL Response Code: ");
+    Serial.println(httpResponseCode);
+
+    httpMySQL.end();
+}
+
+void sendToPowerBI(float temperature, String datetime) {
+    http.begin(secureClient, powerbiUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    String jsonData = "[{\"Temperature\":" + String(temperature, 2) + ", \"Datetime\": \"" + datetime + "\"}]";
+    int httpCode = http.POST(jsonData);
+
+    Serial.print("Power BI Response Code: ");
+    Serial.println(httpCode);
+
+    http.end();
+}
+
+void getDatetime() {
+    datetime = String(year()) + "-" + String(month()) + "-" + String(day()) + " " + String(hour()) + ":" + String(minute()) + ":" + String(second());
+}
+
+void updateLCD(float temperature, String datetime) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Temp: ");
+    lcd.print(temperature, 2);
+    lcd.print(" C");
+
+    lcd.setCursor(0, 1);
+    lcd.print(datetime);
+}
+
+void checkSensorFaults() {
+    uint8_t fault = thermo.readFault();
+    if (fault) {
+        Serial.print("Sensor Fault 0x");
+        Serial.println(fault, HEX);
+        thermo.clearFault();
+    }
+}
+
+// NTP functions remain unchanged
+time_t getNtpTime() {
+    IPAddress ntpServerIP;
+
+    while (Udp.parsePacket() > 0);  // Discard any previously received packets
+    Serial.println("Transmit NTP Request");
+    WiFi.hostByName(ntpServerName, ntpServerIP);
+    Serial.print(ntpServerName);
+    Serial.print(": ");
+    Serial.println(ntpServerIP);
+    sendNTPpacket(ntpServerIP);
+    uint32_t beginWait = millis();
+    while (millis() - beginWait < 1500) {
+        int size = Udp.parsePacket();
+        if (size >= 48) {
+            byte packetBuffer[48];
+            Udp.read(packetBuffer, 48);
+            unsigned long secsSince1900;
+            secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+            secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+            secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+            secsSince1900 |= (unsigned long)packetBuffer[43];
+            return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+        }
+    }
+    return 0;
+}
+
+void sendNTPpacket(IPAddress &address) {
+    byte packetBuffer[48];
+    memset(packetBuffer, 0, 48);
+    packetBuffer[0] = 0b11100011;
+    packetBuffer[1] = 0;
+    packetBuffer[2] = 6;
+    packetBuffer[3] = 0xEC;
+
+    Udp.beginPacket(address, 123);
+    Udp.write(packetBuffer, 48);
+    Udp.endPacket();
+}
