@@ -8,8 +8,9 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <Esp.h>
 
-// WiFi Configuration
+// WiFi Configuration  
 const char* WIFI_SSID = "Tan_Pocket";
 const char* WIFI_PASSWORD = "15932456";
 
@@ -37,7 +38,7 @@ byte packetBuffer[NTP_PACKET_SIZE];
 String datetime;
 
 // LCD Configuration
-LiquidCrystal_I2C lcd(0x27, 16, 2); // ที่อยู่ I2C 0x27, ขนาดจอ 16x2
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // MAX31865 configuration (SPI)
 #define MAX_CS   D3  // Chip Select (CS)
@@ -47,6 +48,22 @@ LiquidCrystal_I2C lcd(0x27, 16, 2); // ที่อยู่ I2C 0x27, ขนา
 
 // Initialize MAX31865
 Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX_CS, MAX_SDI, MAX_SDO, MAX_CLK);
+
+// Reference resistor value & RTD nominal
+#define RREF      430.0
+#define RNOMINAL  100.0
+
+// ตัวแปรสำหรับเก็บค่าอุณหภูมิล่าสุด
+static float lastTemp = -999;
+
+void initWatchdog() {
+ ESP.wdtDisable();
+ ESP.wdtEnable(WDTO_8S);
+}
+
+void ICACHE_RAM_ATTR handleCrash() {
+ ESP.restart();
+}
 
 void sendNTPpacket(const char* address) {
  memset(packetBuffer, 0, NTP_PACKET_SIZE);
@@ -64,14 +81,12 @@ void sendNTPpacket(const char* address) {
 }
 
 time_t getNtpTime() {
- while (Udp.parsePacket() > 0) ; // discard any previously received packets
- Serial.println("Transmitting NTP Request");
+ while (Udp.parsePacket() > 0) ;
  sendNTPpacket(ntpServerName);
  uint32_t beginWait = millis();
  while (millis() - beginWait < 1500) {
    int size = Udp.parsePacket();
    if (size >= NTP_PACKET_SIZE) {
-     Serial.println("Received NTP Response");
      Udp.read(packetBuffer, NTP_PACKET_SIZE);
      unsigned long secsSince1900;
      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
@@ -81,25 +96,22 @@ time_t getNtpTime() {
      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
    }
  }
- Serial.println("No NTP Response");
  return 0;
 }
 
 void getDatetime() {
  char buffer[25];
- snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", 
+ snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
           year(), month(), day(), hour(), minute(), second());
  datetime = String(buffer);
 }
 
 void connectToWiFi() {
+ WiFi.mode(WIFI_STA);
  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
- Serial.print("Connecting to WiFi...");
  while (WiFi.status() != WL_CONNECTED) {
    delay(500);
-   Serial.print(".");
  }
- Serial.println("\nConnected to WiFi!");
 }
 
 bool initFirebase() {
@@ -107,14 +119,7 @@ bool initFirebase() {
  config.signer.tokens.legacy_token = DATABASE_SECRET;
  Firebase.begin(&config, &auth);
  Firebase.reconnectWiFi(true);
- 
- if (Firebase.ready()) {
-   Serial.println("Firebase connected successfully!");
-   return true;
- } else {
-   Serial.println("Failed to connect to Firebase!");
-   return false;
- }
+ return Firebase.ready();
 }
 
 void sendToFirebase(float temperature, String datetime) {
@@ -128,107 +133,96 @@ void sendToFirebase(float temperature, String datetime) {
  
  String path = "/sensor/" + pathTimestamp;
  
- if (Firebase.setJSON(fbdo, path, json)) {
-   Serial.println("✅ Data sent successfully:");
-   Serial.println("Path: " + path);
-   Serial.println("Temperature: " + String(temperature));
-   Serial.println("Timestamp: " + datetime);
- } else {
-   Serial.print("❌ Error sending data: ");
-   Serial.println(fbdo.errorReason());
- }
+ Firebase.setJSON(fbdo, path, json);
 }
 
 void sendToPowerBI(float temperature, String datetime) {
  http.begin(secureClient, powerbiUrl);
  http.addHeader("Content-Type", "application/json");
  String jsonData = "[{\"Temperature\": " + String(temperature, 2) + ", \"Datetime\": \"" + datetime + "\"}]";
- int httpCode = http.POST(jsonData);
- Serial.print("Power BI Response Code: ");
- Serial.println(httpCode);
+ http.POST(jsonData);
  http.end();
 }
 
 void updateLCD(float temperature) {
+ if (abs(temperature - lastTemp) > 0.1) {
+   char tempStr[10];
+   sprintf(tempStr, "%-6.2f C", temperature);
+   lcd.setCursor(0, 1);
+   lcd.print(tempStr);
+   lastTemp = temperature;
+ }
+}
+
+void setup() {  
+ // Initialize watchdog
+ initWatchdog();
+ 
+ // Initialize LCD
+ Wire.begin();
+ lcd.begin(16, 2);
+ lcd.backlight();
  lcd.clear();
  lcd.setCursor(0, 0);
  lcd.print("Temperature:");
- lcd.setCursor(0, 1);
- lcd.print(temperature, 2);
- lcd.print(" C");
-}
-
-void setup() {
-  Serial.begin(115200);
-  
-  // Initialize LCD
-  Wire.begin();
-  lcd.begin(16, 2);  // ระบุขนาด 16 คอลัมน์, 2 แถว
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Temperature:");
-  
-  connectToWiFi();
-  secureClient.setInsecure();
-  
-  Udp.begin(localPort);
-  
-  setSyncProvider(getNtpTime);
-  setSyncInterval(300);
-  
-  Serial.println("Waiting for time sync");
-  while (timeStatus() != timeSet) {
-    Serial.print(".");
-    delay(1000);
-  }
-  Serial.println("\nTime Synchronized!");
-  
-  if (!initFirebase()) {
-    Serial.println("Failed to initialize Firebase. Restarting...");
-    delay(1000);
-    ESP.restart();
-  }
-  
-  thermo.begin(MAX31865_3WIRE);
+ 
+ // Initialize WiFi
+ WiFi.setAutoReconnect(true);
+ WiFi.persistent(true);
+ connectToWiFi();
+ 
+ secureClient.setInsecure();
+ Udp.begin(localPort);
+ 
+ setSyncProvider(getNtpTime);
+ setSyncInterval(300);
+ 
+ while (timeStatus() != timeSet) {
+   delay(1000);
+ }
+ 
+ if (!initFirebase()) {
+   ESP.restart();
+ }
+ 
+ // Initialize MAX31865
+ if (!thermo.begin(MAX31865_3WIRE)) {
+   lcd.setCursor(0, 0);
+   lcd.print("Sensor Error!");
+   while (1) delay(10);
+ }
+ 
+ thermo.setThresholds(0x0000, 0x7fff);
 }
 
 void loop() {
- if (WiFi.status() != WL_CONNECTED) {
-   Serial.println("WiFi connection lost. Reconnecting...");
-   connectToWiFi();
-   return;
- }
-
- if (!Firebase.ready()) {
-   Serial.println("Firebase connection lost. Reinitializing...");
-   if (!initFirebase()) {
-     Serial.println("Firebase reinitialization failed. Restarting...");
-     delay(1000);
-     ESP.restart();
+ ESP.wdtFeed();
+ 
+ static unsigned long lastWiFiCheck = 0;
+ if (millis() - lastWiFiCheck > 10000) {
+   lastWiFiCheck = millis();
+   if (WiFi.status() != WL_CONNECTED) {
+     WiFi.reconnect();
+     delay(500);
    }
-   return;
  }
 
- float temperature = thermo.temperature(100.0, 430.0);
- if (!isnan(temperature)) {
-   getDatetime();
-   Serial.print("Temperature: ");
-   Serial.println(temperature);
-   Serial.print("Datetime: ");
-   Serial.println(datetime);
-   
-   // Update LCD display
-   updateLCD(temperature);
-   
-   sendToFirebase(temperature, datetime);
-   sendToPowerBI(temperature, datetime);
- } else {
-   Serial.println("Failed to read temperature!");
-   lcd.clear();
-   lcd.setCursor(0, 0);
-   lcd.print("Sensor Error!");
+ // Read temperature
+ float temperature = thermo.temperature(RNOMINAL, RREF);
+ 
+ // Check for faults
+ uint8_t fault = thermo.readFault();
+ if (fault) {
+   thermo.clearFault();
+   return;
  }
  
- delay(100000);
+ if (!isnan(temperature) && temperature > -50 && temperature < 200) {
+   getDatetime();
+   updateLCD(temperature);
+   sendToFirebase(temperature, datetime);
+   sendToPowerBI(temperature, datetime);
+ }
+ 
+ delay(5000);
 }
