@@ -56,173 +56,242 @@ Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX_CS, MAX_SDI, MAX_SDO, MAX_CLK);
 // ตัวแปรสำหรับเก็บค่าอุณหภูมิล่าสุด
 static float lastTemp = -999;
 
+// Add new variables for timing control
+const unsigned long SENSOR_READ_INTERVAL = 50000;  // 5 min.
+unsigned long lastSensorReadTime = 0;
+unsigned long lastSuccessfulUpload = 0;
+const int MAX_RETRY_DELAY = 1000;  // Maximum retry delay in milliseconds
+
+// Struct to store temperature reading with timestamp
+struct TempReading {
+    float temperature;
+    String timestamp;
+    bool isValid;
+};
+
 void initWatchdog() {
- ESP.wdtDisable();
- ESP.wdtEnable(WDTO_8S);
+    ESP.wdtDisable();
+    ESP.wdtEnable(WDTO_8S);
 }
 
 void ICACHE_RAM_ATTR handleCrash() {
- ESP.restart();
+    ESP.restart();
 }
 
 void sendNTPpacket(const char* address) {
- memset(packetBuffer, 0, NTP_PACKET_SIZE);
- packetBuffer[0] = 0b11100011;
- packetBuffer[1] = 0;
- packetBuffer[2] = 6;
- packetBuffer[3] = 0xEC;
- packetBuffer[12] = 49;
- packetBuffer[13] = 0x4E;
- packetBuffer[14] = 49;
- packetBuffer[15] = 52;
- Udp.beginPacket(address, 123);
- Udp.write(packetBuffer, NTP_PACKET_SIZE);
- Udp.endPacket();
+    memset(packetBuffer, 0, NTP_PACKET_SIZE);
+    packetBuffer[0] = 0b11100011;
+    packetBuffer[1] = 0;
+    packetBuffer[2] = 6;
+    packetBuffer[3] = 0xEC;
+    packetBuffer[12] = 49;
+    packetBuffer[13] = 0x4E;
+    packetBuffer[14] = 49;
+    packetBuffer[15] = 52;
+    Udp.beginPacket(address, 123);
+    Udp.write(packetBuffer, NTP_PACKET_SIZE);
+    Udp.endPacket();
 }
 
 time_t getNtpTime() {
- while (Udp.parsePacket() > 0) ;
- sendNTPpacket(ntpServerName);
- uint32_t beginWait = millis();
- while (millis() - beginWait < 1500) {
-   int size = Udp.parsePacket();
-   if (size >= NTP_PACKET_SIZE) {
-     Udp.read(packetBuffer, NTP_PACKET_SIZE);
-     unsigned long secsSince1900;
-     secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
-     secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-     secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-     secsSince1900 |= (unsigned long)packetBuffer[43];
-     return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
-   }
- }
- return 0;
+    while (Udp.parsePacket() > 0) ;
+    sendNTPpacket(ntpServerName);
+    uint32_t beginWait = millis();
+    while (millis() - beginWait < 1500) {
+        int size = Udp.parsePacket();
+        if (size >= NTP_PACKET_SIZE) {
+            Udp.read(packetBuffer, NTP_PACKET_SIZE);
+            unsigned long secsSince1900;
+            secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+            secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+            secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+            secsSince1900 |= (unsigned long)packetBuffer[43];
+            return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+        }
+    }
+    return 0;
 }
 
 void getDatetime() {
- char buffer[25];
- snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
-          year(), month(), day(), hour(), minute(), second());
- datetime = String(buffer);
+    char buffer[25];
+    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
+             year(), month(), day(), hour(), minute(), second());
+    datetime = String(buffer);
 }
 
 void connectToWiFi() {
- WiFi.mode(WIFI_STA);
- WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
- while (WiFi.status() != WL_CONNECTED) {
-   delay(500);
- }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+    }
 }
 
 bool initFirebase() {
- config.database_url = DATABASE_URL;
- config.signer.tokens.legacy_token = DATABASE_SECRET;
- Firebase.begin(&config, &auth);
- Firebase.reconnectWiFi(true);
- return Firebase.ready();
+    config.database_url = DATABASE_URL;
+    config.signer.tokens.legacy_token = DATABASE_SECRET;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    return Firebase.ready();
 }
 
-void sendToFirebase(float temperature, String datetime) {
- FirebaseJson json;
- json.set("temperature", temperature);
- 
- String pathTimestamp = datetime;
- pathTimestamp.replace(" UTC+07", "");
- pathTimestamp.replace(" ", "_");
- pathTimestamp.replace(":", "-");
- 
- String path = "/sensor/" + pathTimestamp;
- 
- Firebase.setJSON(fbdo, path, json);
+// Function to get a temperature reading with proper timestamp
+TempReading getTempReading() {
+    TempReading reading;
+    reading.isValid = false;
+    
+    // Get temperature
+    float temp = thermo.temperature(RNOMINAL, RREF);
+    
+    // Validate temperature reading
+    if (!isnan(temp) && temp > -50 && temp < 200) {
+        // Check for faults
+        uint8_t fault = thermo.readFault();
+        if (!fault) {
+            reading.temperature = temp;
+            getDatetime();  // Updates global datetime variable
+            reading.timestamp = datetime;
+            reading.isValid = true;
+        } else {
+            thermo.clearFault();
+        }
+    }
+    
+    return reading;
 }
 
-void sendToPowerBI(float temperature, String datetime) {
- http.begin(secureClient, powerbiUrl);
- http.addHeader("Content-Type", "application/json");
- String jsonData = "[{\"Temperature\": " + String(temperature, 2) + ", \"Datetime\": \"" + datetime + "\"}]";
- http.POST(jsonData);
- http.end();
+// Modified Firebase upload function with retry mechanism
+bool sendToFirebaseWithRetry(const TempReading& reading, int maxRetries = 3) {
+    if (!reading.isValid) return false;
+
+    FirebaseJson json;
+    json.set("temperature", String(reading.temperature, 2).toFloat());
+    
+    String pathTimestamp = reading.timestamp;
+    pathTimestamp.replace(" UTC+07", "");
+    pathTimestamp.replace(" ", "_");
+    pathTimestamp.replace(":", "-");
+    
+    String path = "/sensor/" + pathTimestamp;
+    
+    for (int i = 0; i < maxRetries; i++) {
+        if (Firebase.setJSON(fbdo, path, json)) {
+            return true;
+        }
+        delay(min((i + 1) * 100, MAX_RETRY_DELAY));  // Exponential backoff
+    }
+    
+    return false;
+}
+
+// Modified PowerBI upload function with retry mechanism
+bool sendToPowerBIWithRetry(const TempReading& reading, int maxRetries = 3) {
+    if (!reading.isValid) return false;
+
+    for (int i = 0; i < maxRetries; i++) {
+        http.begin(secureClient, powerbiUrl);
+        http.addHeader("Content-Type", "application/json");
+        String jsonData = "[{\"Temperature\": " + String(reading.temperature, 2) + 
+                         ", \"Datetime\": \"" + reading.timestamp + "\"}]";
+        
+        int httpCode = http.POST(jsonData);
+        http.end();
+        
+        if (httpCode == HTTP_CODE_OK) {
+            return true;
+        }
+        delay(min((i + 1) * 100, MAX_RETRY_DELAY));  // Exponential backoff
+    }
+    
+    return false;
 }
 
 void updateLCD(float temperature) {
- if (abs(temperature - lastTemp) > 0.1) {
-   char tempStr[10];
-   sprintf(tempStr, "%-6.2f C", temperature);
-   lcd.setCursor(0, 1);
-   lcd.print(tempStr);
-   lastTemp = temperature;
- }
+    if (abs(temperature - lastTemp) > 0.1) {
+        char tempStr[10];
+        sprintf(tempStr, "%-6.2f C", temperature);
+        lcd.setCursor(0, 1);
+        lcd.print(tempStr);
+        lastTemp = temperature;
+    }
 }
 
 void setup() {  
- // Initialize watchdog
- initWatchdog();
- 
- // Initialize LCD
- Wire.begin();
- lcd.begin(16, 2);
- lcd.backlight();
- lcd.clear();
- lcd.setCursor(0, 0);
- lcd.print("Temperature:");
- 
- // Initialize WiFi
- WiFi.setAutoReconnect(true);
- WiFi.persistent(true);
- connectToWiFi();
- 
- secureClient.setInsecure();
- Udp.begin(localPort);
- 
- setSyncProvider(getNtpTime);
- setSyncInterval(300);
- 
- while (timeStatus() != timeSet) {
-   delay(1000);
- }
- 
- if (!initFirebase()) {
-   ESP.restart();
- }
- 
- // Initialize MAX31865
- if (!thermo.begin(MAX31865_3WIRE)) {
-   lcd.setCursor(0, 0);
-   lcd.print("Sensor Error!");
-   while (1) delay(10);
- }
- 
- thermo.setThresholds(0x0000, 0x7fff);
+    // Initialize watchdog
+    initWatchdog();
+    
+    // Initialize LCD
+    Wire.begin();
+    lcd.begin(16, 2);
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Temperature:");
+    
+    // Initialize WiFi
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    connectToWiFi();
+    
+    secureClient.setInsecure();
+    Udp.begin(localPort);
+    
+    setSyncProvider(getNtpTime);
+    setSyncInterval(300);
+    
+    while (timeStatus() != timeSet) {
+        delay(1000);
+    }
+    
+    if (!initFirebase()) {
+        ESP.restart();
+    }
+    
+    // Initialize MAX31865
+    if (!thermo.begin(MAX31865_3WIRE)) {
+        lcd.setCursor(0, 0);
+        lcd.print("Sensor Error!");
+        while (1) delay(10);
+    }
+    
+    thermo.setThresholds(0x0000, 0x7fff);
 }
 
 void loop() {
- ESP.wdtFeed();
- 
- static unsigned long lastWiFiCheck = 0;
- if (millis() - lastWiFiCheck > 10000) {
-   lastWiFiCheck = millis();
-   if (WiFi.status() != WL_CONNECTED) {
-     WiFi.reconnect();
-     delay(500);
-   }
- }
+    ESP.wdtFeed();
+    
+    // Check WiFi connection
+    static unsigned long lastWiFiCheck = 0;
+    if (millis() - lastWiFiCheck > 10000) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.reconnect();
+            delay(500);
+        }
+    }
 
- // Read temperature
- float temperature = thermo.temperature(RNOMINAL, RREF);
- 
- // Check for faults
- uint8_t fault = thermo.readFault();
- if (fault) {
-   thermo.clearFault();
-   return;
- }
- 
- if (!isnan(temperature) && temperature > -50 && temperature < 200) {
-   getDatetime();
-   updateLCD(temperature);
-   sendToFirebase(temperature, datetime);
-   sendToPowerBI(temperature, datetime);
- }
- 
- delay(5000);
+    // Only read sensor at fixed intervals
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
+        lastSensorReadTime = currentMillis;
+        
+        // Get temperature reading with timestamp
+        TempReading reading = getTempReading();
+        
+        if (reading.isValid) {
+            // Update LCD
+            updateLCD(reading.temperature);
+            
+            // Try to upload data
+            bool firebaseSuccess = sendToFirebaseWithRetry(reading);
+            bool powerBISuccess = sendToPowerBIWithRetry(reading);
+            
+            if (firebaseSuccess && powerBISuccess) {
+                lastSuccessfulUpload = currentMillis;
+            }
+        }
+    }
+    
+    // Small delay to prevent excessive CPU usage
+    delay(100);
 }
